@@ -26,4 +26,4 @@ jobs:
 
   step2:
     name: Run Netlify Website Quality Checks ... But does it get executed like this?
-    uses: ./netlify-quality-checks.yml
+    uses: ./.github/workflows/netlify-quality-checks.yml
