@@ -1,0 +1,32 @@
+name: Trigger CI
+on:
+  pull_request:
+    branches:
+      - main
+      - development
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+jobs:
+  setup:
+    name: Run check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+  step2:
+    name: Print something useful
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print something useful
+        run: echo "Hello, World!"
