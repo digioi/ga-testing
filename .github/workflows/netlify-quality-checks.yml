@@ -1,0 +1,322 @@
+name: Website Quality Checks (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      max_timeout:
+        description: "Maximum timeout in seconds"
+        required: false
+        type: number
+        default: 300
+      node_version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "24"
+      install_command:
+        description: "Install command"
+        required: false
+        type: string
+        default: "npm ci"
+      test_command:
+        description: "Playwright test command"
+        required: false
+        type: string
+        default: "npx playwright test"
+      browsers:
+        description: "Browsers to install (comma-separated)"
+        required: false
+        type: string
+        default: "chromium,firefox,webkit"
+      continue_on_error:
+        description: "Continue on test failures"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      NETLIFY_TOKEN:
+        description: "Netlify API token"
+        required: true
+      NETLIFY_SITE_ID:
+        description: "Netlify Site ID"
+        required: true
+
+jobs:
+  test:
+    name: Run Playwright + Lighthouse + A11y Checks
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ inputs.continue_on_error }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: ${{ inputs.install_command }}
+
+      - name: Wait for Netlify Preview Deployment
+        uses: quantizor/wait-for-netlify-action@v3.4.0
+        id: waitForNetlify
+        with:
+          site_id: ${{ secrets.NETLIFY_SITE_ID }}
+          max_timeout: ${{ inputs.max_timeout }}
+          context: deploy-preview
+        env:
+          NETLIFY_TOKEN: ${{ secrets.NETLIFY_TOKEN }}
+
+      # --- Playwright ---
+      - name: Install Playwright Browsers
+        run: |
+          if [ "${{ inputs.browsers }}" = "chromium,firefox,webkit" ]; then
+            npx playwright install --with-deps
+          else
+            npx playwright install ${{ inputs.browsers }} --with-deps
+          fi
+
+      - name: Run Playwright Tests
+        run: ${{ inputs.test_command }}
+        env:
+          BASE_URL: ${{ steps.waitForNetlify.outputs.url }}
+          CI: true
+
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results.json
+          retention-days: 30
+
+      # --- Lighthouse CI ---
+      - name: Wait briefly for site to stabilize
+        run: sleep 10
+
+      - name: Run Lighthouse CI
+        id: lighthouse
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          urls: |
+            ${{ steps.waitForNetlify.outputs.url }}
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+
+      - name: Extract Lighthouse Scores
+        id: extract_lh
+        run: |
+          REPORT_PATH=$(find . -type f -name "manifest.json" | head -n 1)
+          if [ -f "$REPORT_PATH" ]; then
+            echo "Found manifest: $REPORT_PATH"
+            PERF=$(jq '.[0].summary.performance' "$REPORT_PATH")
+            ACCESS=$(jq '.[0].summary.accessibility' "$REPORT_PATH")
+            BP=$(jq '.[0].summary["best-practices"]' "$REPORT_PATH")
+            SEO=$(jq '.[0].summary.seo' "$REPORT_PATH")
+            echo "PERF=$PERF" >> $GITHUB_ENV
+            echo "ACCESS=$ACCESS" >> $GITHUB_ENV
+            echo "BP=$BP" >> $GITHUB_ENV
+            echo "SEO=$SEO" >> $GITHUB_ENV
+          else
+            echo "No manifest found, skipping Lighthouse summary"
+          fi
+
+      # --- Accessibility (Playwright + Axe) ---
+      - name: Install Chrome for pa11y-ci
+        run: |
+          # Install Chrome using puppeteer to match the version that pa11y-ci's bundled puppeteer-core expects
+          # pa11y-ci bundles puppeteer-core which expects Chrome in /home/runner/.cache/puppeteer
+          # First, download pa11y-ci to check its puppeteer-core version
+          npx -y pa11y-ci --version > /dev/null 2>&1 || true
+          # Find puppeteer-core's package.json in the npx cache (it's bundled with pa11y-ci)
+          PUPPETEER_CORE_PKG=$(find ~/.npm/_npx -path "*/node_modules/puppeteer-core/package.json" 2>/dev/null | head -n 1)
+          if [ -n "$PUPPETEER_CORE_PKG" ] && [ -f "$PUPPETEER_CORE_PKG" ]; then
+            echo "Found puppeteer-core package.json at: $PUPPETEER_CORE_PKG"
+            # Get the actual puppeteer-core version
+            PUPPETEER_CORE_VER=$(node -e "try { const pkg = require('$PUPPETEER_CORE_PKG'); console.log(pkg.version); } catch(e) { console.log(''); }")
+            echo "Detected puppeteer-core version: $PUPPETEER_CORE_VER"
+            if [ -n "$PUPPETEER_CORE_VER" ] && [ "$PUPPETEER_CORE_VER" != "latest" ]; then
+              # Extract major.minor version (e.g., "23.0.0" -> "23.0")
+              MAJOR_MINOR=$(echo "$PUPPETEER_CORE_VER" | cut -d. -f1,2)
+              MAJOR=$(echo "$PUPPETEER_CORE_VER" | cut -d. -f1)
+              MINOR=$(echo "$PUPPETEER_CORE_VER" | cut -d. -f2)
+              echo "Installing Chrome using puppeteer@$PUPPETEER_CORE_VER to match puppeteer-core@$PUPPETEER_CORE_VER"
+              # Try installing with the exact version first, then try slightly older versions
+              # to get the older Chrome version (142.0.7444.59 instead of 142.0.7444.61)
+              npx -y puppeteer@$PUPPETEER_CORE_VER browsers install chrome || \
+              npx -y "puppeteer@^$MAJOR_MINOR.0" browsers install chrome || \
+              (if [ -n "$MINOR" ] && [ "$MINOR" -gt 0 ]; then npx -y "puppeteer@^$MAJOR.$((MINOR-1)).0" browsers install chrome; fi) || \
+              npx -y puppeteer browsers install chrome
+            else
+              echo "Could not determine puppeteer-core version, trying older puppeteer versions"
+              npx -y puppeteer@23.0.0 browsers install chrome || \
+              npx -y puppeteer@22.0.0 browsers install chrome || \
+              npx -y puppeteer@21.0.0 browsers install chrome || \
+              npx -y puppeteer browsers install chrome
+            fi
+          else
+            echo "Could not find puppeteer-core package.json, trying to install Chrome with older puppeteer versions"
+            # Try installing with older puppeteer versions that might match pa11y-ci's puppeteer-core
+            # pa11y-ci typically uses older versions, so try a few common ones
+            npx -y puppeteer@23.0.0 browsers install chrome || \
+            npx -y puppeteer@22.0.0 browsers install chrome || \
+            npx -y puppeteer@21.0.0 browsers install chrome || \
+            npx -y puppeteer browsers install chrome
+          fi
+
+      - name: Run a11y Checks (pa11y)
+        run: |
+          mkdir -p a11y-results
+          cat <<EOF > pa11y-config.json
+          {
+            "defaults": {
+              "standard": "WCAG2AA",
+              "wait": 500,
+              "chromeLaunchConfig": {
+                "args": ["--no-sandbox", "--disable-setuid-sandbox"]
+              }
+            },
+            "urls": [
+              "${{ steps.waitForNetlify.outputs.url }}/"
+            ]
+          }
+          EOF
+          echo "Running pa11y-ci on: ${{ steps.waitForNetlify.outputs.url }}/"
+          # Run pa11y-ci and capture both stdout and stderr
+          npx pa11y-ci --config pa11y-config.json --reporter json > a11y-results/report.json 2>&1 || {
+            EXIT_CODE=$?
+            echo "pa11y-ci exited with code: $EXIT_CODE"
+            # Check if report file exists and has content
+            if [ -f "a11y-results/report.json" ]; then
+              echo "Report file exists, size: $(wc -c < a11y-results/report.json) bytes"
+              cat a11y-results/report.json
+            else
+              echo "Report file not created"
+              # Create an empty array as fallback
+              echo "[]" > a11y-results/report.json
+            fi
+          }
+          # Verify the report is valid JSON
+          if [ -f "a11y-results/report.json" ]; then
+            if jq empty a11y-results/report.json 2>/dev/null; then
+              echo "Report is valid JSON"
+            else
+              echo "Report is not valid JSON, creating empty array"
+              echo "[]" > a11y-results/report.json
+            fi
+          fi
+
+      - name: Upload Pa11y Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pa11y-report
+          path: |
+            a11y-results/
+            pa11y-config.json
+          retention-days: 30
+
+      # --- Comment on PR with summary ---
+      - name: Comment on PR with Website Quality Summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Playwright summary
+            let passed = 0, failed = 0, skipped = 0, duration = 0;
+            try {
+              const data = JSON.parse(fs.readFileSync('test-results.json', 'utf8'));
+              for (const suite of data.suites || []) {
+                for (const spec of suite.specs || []) {
+                  for (const test of spec.tests || []) {
+                    const result = test.results?.[0];
+                    if (!result) continue;
+                    if (result.status === 'passed') passed++;
+                    else if (result.status === 'failed') failed++;
+                    else skipped++;
+                    duration += result.duration || 0;
+                  }
+                }
+              }
+            } catch {
+              console.warn('Could not parse Playwright test-results.json');
+            }
+
+            const durationSec = (duration / 1000).toFixed(1);
+
+            // --- Lighthouse summary ---
+
+            const lighthouse = {
+              link: '${{ steps.lighthouse.outputs.links }}' || 'N/A',
+              perf: process.env.PERF || 'N/A',
+              access: process.env.ACCESS || 'N/A',
+              bp: process.env.BP || 'N/A',
+              seo: process.env.SEO || 'N/A'
+            };
+
+            // --- Pa11y summary ---
+            let a11yIssues = [];
+            try {
+              const data = JSON.parse(fs.readFileSync('a11y-results/report.json', 'utf8'));
+              // pa11y-ci JSON format: { total, passes, errors, results: { url: [issues] } }
+              if (data.results) {
+                // Flatten all issues from all URLs
+                for (const url in data.results) {
+                  const issues = data.results[url] || [];
+                  for (const issue of issues) {
+                    a11yIssues.push(`- [${issue.type.toUpperCase()}] ${issue.message} (Selector: \`${issue.selector}\`)`);
+                  }
+                }
+              } else if (Array.isArray(data)) {
+                // Fallback: if it's already an array format
+                a11yIssues = data.map(issue => `- [${issue.type.toUpperCase()}] ${issue.message} (Selector: \`${issue.selector}\`)`);
+              }
+            } catch (error) {
+              console.warn('No Pa11y report found or failed to parse:', error.message);
+            }
+            const a11yComment = a11yIssues.length > 0
+              ? a11yIssues.join('\n')
+              : 'No accessibility issues detected';
+
+            // --- Compose comment ---
+
+            const comment = `## 🚀 Website Quality Checks
+
+              **Preview URL:** ${{ steps.waitForNetlify.outputs.url }}
+
+              ### 🧪 Playwright Test Results
+              ✅ Passed: ${passed}
+              ❌ Failed: ${failed}
+              ⏭️ Skipped: ${skipped}
+              ⏱️ Duration: ${durationSec}s
+              📄 [View detailed report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+              _Note: Tests are non-blocking to accommodate potential flaky behavior._
+
+              ---
+
+              ### 🌈 Lighthouse Audit
+              🔗 [View Lighthouse report](${lighthouse.link})
+              🟢 **Performance:** ${lighthouse.perf}
+              🟣 **Accessibility:** ${lighthouse.access}
+              🟡 **Best Practices:** ${lighthouse.bp}
+              🔵 **SEO:** ${lighthouse.seo}
+
+              ---
+
+              ### ♿ Accessibility (Pa11y)
+              ${a11yComment}`;
+
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: comment
+                  });

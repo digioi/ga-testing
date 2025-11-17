@@ -26,4 +26,4 @@ jobs:
 
   step2:
     name: Run Netlify Website Quality Checks ... But does it get executed like this?
-    uses: APSPhysics/aps-github-workflows/blob/main/.github/workflows/netlify-website-quality-checks.yml@main
+    uses: ./netlify-quality-checks.yml
